@@ -11,14 +11,45 @@ import React, { useRef, useEffect } from 'react';
  * 
  * Based on FitCoachAR proposal Section 4.4
  */
+const MEDIAPIPE_CONNECTIONS = [
+  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+  [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [27, 29], [27, 31],
+  [24, 26], [26, 28], [28, 30], [28, 32],
+];
+
+const MOVENET_CONNECTIONS = [
+  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+  [5, 11], [6, 12], [11, 12],
+  [11, 13], [13, 15],
+  [12, 14], [14, 16],
+  [0, 1], [0, 2], [1, 3], [2, 4],
+];
+
+const MEDIAPIPE_JOINTS = {
+  rightElbow: 14,
+  rightKnee: 26,
+};
+
+const MOVENET_JOINTS = {
+  rightElbow: 8,
+  rightKnee: 14,
+};
+
 export default function AROverlay({ 
   landmarks, 
   feedbackLandmarks = [],
   selectedExercise,
   targetAngles = {},
-  currentAngles = {}
+  currentAngles = {},
+  backend
 }) {
   const canvasRef = useRef(null);
+
+  const backendKey = backend && backend.startsWith('movenet') ? 'movenet' : 'mediapipe';
+  const connections = backendKey === 'movenet' ? MOVENET_CONNECTIONS : MEDIAPIPE_CONNECTIONS;
+  const joints = backendKey === 'movenet' ? MOVENET_JOINTS : MEDIAPIPE_JOINTS;
+  const VISIBILITY_THRESHOLD = backendKey === 'movenet' ? 0.05 : 0.5;
 
   useEffect(() => {
     if (!canvasRef.current || !landmarks || landmarks.length === 0) return;
@@ -29,21 +60,13 @@ export default function AROverlay({
     // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // MediaPipe Pose connections for skeleton rendering
-    const POSE_CONNECTIONS = [
-      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], // Arms
-      [11, 23], [12, 24], [23, 24], // Torso
-      [23, 25], [25, 27], [27, 29], [27, 31], // Left leg
-      [24, 26], [26, 28], [28, 30], [28, 32], // Right leg
-    ];
-
     // Draw skeleton connections
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
     ctx.lineWidth = 3;
-    POSE_CONNECTIONS.forEach(([start, end]) => {
+    connections.forEach(([start, end]) => {
       const startLm = landmarks[start];
       const endLm = landmarks[end];
-      if (startLm && endLm && startLm.visibility > 0.5 && endLm.visibility > 0.5) {
+      if (startLm && endLm && startLm.visibility > VISIBILITY_THRESHOLD && endLm.visibility > VISIBILITY_THRESHOLD) {
         ctx.beginPath();
         ctx.moveTo(startLm.x * canvas.width, startLm.y * canvas.height);
         ctx.lineTo(endLm.x * canvas.width, endLm.y * canvas.height);
@@ -53,7 +76,7 @@ export default function AROverlay({
 
     // Draw landmarks with color-coded feedback
     landmarks.forEach((lm, index) => {
-      if (lm.visibility < 0.5) return;
+      if (lm.visibility < VISIBILITY_THRESHOLD) return;
 
       const x = lm.x * canvas.width;
       const y = lm.y * canvas.height;
@@ -73,7 +96,7 @@ export default function AROverlay({
     // Draw angle indicators for relevant joints
     const drawAngleIndicator = (centerIdx, angle, targetAngle, label) => {
       const lm = landmarks[centerIdx];
-      if (!lm || lm.visibility < 0.5) return;
+      if (!lm || lm.visibility < VISIBILITY_THRESHOLD) return;
 
       const x = lm.x * canvas.width;
       const y = lm.y * canvas.height;
@@ -99,18 +122,18 @@ export default function AROverlay({
     // Exercise-specific angle visualization
     if (selectedExercise === 'bicep_curls') {
       if (currentAngles.rightElbow !== undefined && targetAngles.rightElbow !== undefined) {
-        drawAngleIndicator(14, currentAngles.rightElbow, targetAngles.rightElbow, 'R Elbow');
+        drawAngleIndicator(joints.rightElbow, currentAngles.rightElbow, targetAngles.rightElbow, 'R Elbow');
       }
     } else if (selectedExercise === 'squats') {
       if (currentAngles.rightKnee !== undefined && targetAngles.rightKnee !== undefined) {
-        drawAngleIndicator(26, currentAngles.rightKnee, targetAngles.rightKnee, 'R Knee');
+        drawAngleIndicator(joints.rightKnee, currentAngles.rightKnee, targetAngles.rightKnee, 'R Knee');
       }
     }
 
     // Draw directional arrows for correction guidance
     feedbackLandmarks.forEach(idx => {
       const lm = landmarks[idx];
-      if (!lm || lm.visibility < 0.5) return;
+      if (!lm || lm.visibility < VISIBILITY_THRESHOLD) return;
 
       const x = lm.x * canvas.width;
       const y = lm.y * canvas.height;
@@ -118,9 +141,9 @@ export default function AROverlay({
       // Draw arrow based on exercise and joint
       let arrowDirection = { dx: 0, dy: 0 };
       
-      if (selectedExercise === 'bicep_curls' && idx === 14) { // Right elbow
+      if (selectedExercise === 'bicep_curls' && idx === joints.rightElbow) { // Right elbow
         arrowDirection = { dx: 0, dy: -30 }; // Point upward for curl
-      } else if (selectedExercise === 'squats' && idx === 26) { // Right knee
+      } else if (selectedExercise === 'squats' && idx === joints.rightKnee) { // Right knee
         arrowDirection = { dx: 0, dy: 30 }; // Point downward for depth
       }
 
@@ -153,7 +176,7 @@ export default function AROverlay({
       }
     });
 
-  }, [landmarks, feedbackLandmarks, selectedExercise, targetAngles, currentAngles]);
+  }, [landmarks, feedbackLandmarks, selectedExercise, targetAngles, currentAngles, backendKey]);
 
   return (
     <canvas

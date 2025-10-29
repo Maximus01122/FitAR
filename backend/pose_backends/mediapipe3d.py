@@ -9,6 +9,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from base64 import b64encode
+from calibration_store import CalibrationRecord, new_record, store
 from filters import LandmarkSmoother
 from kinematics import AngularFeatureExtractor
 from llm_feedback import LLMFeedbackGenerator
@@ -27,14 +29,35 @@ class MediaPipe3DBackend(PoseBackend):
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
             model_complexity=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
             enable_segmentation=False,
         )
         self.world_smoother = LandmarkSmoother(window_length=5, polyorder=2)
         self.llm_feedback = LLMFeedbackGenerator(use_api=False)
         self.user_profile = {"upper_arm_length": None, "thigh_length": None}
+        self.current_mode = "common"
+        self.pending_calibration: Optional[Dict[str, Any]] = None
+        self.last_frame_bgr: Optional[np.ndarray] = None
         self.reset_state(reset_calibration=True)
+        self._apply_active_calibration("bicep_curls")
+        self._apply_active_calibration("squats")
+
+    def _required_joints(self, exercise: Optional[str]) -> List[int]:
+        pose = self.mp_pose.PoseLandmark
+        if exercise == "bicep_curls":
+            return [
+                pose.RIGHT_SHOULDER.value,
+                pose.RIGHT_ELBOW.value,
+                pose.RIGHT_WRIST.value,
+            ]
+        if exercise == "squats":
+            return [
+                pose.RIGHT_HIP.value,
+                pose.RIGHT_KNEE.value,
+                pose.RIGHT_ANKLE.value,
+            ]
+        return [pose.RIGHT_SHOULDER.value, pose.RIGHT_ELBOW.value]
 
     def reset_state(self, reset_calibration: bool = False):
         self.curl_counter = 0
@@ -67,55 +90,259 @@ class MediaPipe3DBackend(PoseBackend):
             self.arm_contracted_angle = getattr(self, "arm_contracted_angle", 30)
             self.squat_up_angle = getattr(self, "squat_up_angle", 160)
             self.squat_down_angle = getattr(self, "squat_down_angle", 50)
+        self._apply_active_calibration("bicep_curls")
+        self._apply_active_calibration("squats")
+
+    BICEP_CANONICAL = {"extended": 160.0, "contracted": 30.0}
+    SQUAT_CANONICAL = {"up": 160.0, "down": 50.0}
+
+    def _apply_active_calibration(self, exercise: str):
+        record = store.get_active_record(exercise, self.current_mode)
+        if record:
+            self._apply_record(record)
+
+    def _capture_snapshot(self) -> Optional[str]:
+        if self.last_frame_bgr is None:
+            return None
+        frame = self.last_frame_bgr
+        max_dim = 320
+        h, w = frame.shape[:2]
+        scale = min(1.0, max_dim / max(h, w))
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        success, buf = cv2.imencode(".jpg", frame)
+        if not success:
+            return None
+        return b64encode(buf).decode("utf-8")
+
+    def _apply_record(self, record: Any):
+        if isinstance(record, CalibrationRecord):
+            record_dict = record.to_dict()
+        else:
+            record_dict = record
+        exercise = record_dict.get("exercise")
+        angles = record_dict.get("angles", {})
+        if exercise == "bicep_curls":
+            self.arm_extended_angle = angles.get("extended", self.arm_extended_angle)
+            self.arm_contracted_angle = angles.get("contracted", self.arm_contracted_angle)
+        elif exercise == "squats":
+            self.squat_up_angle = angles.get("up", self.squat_up_angle)
+            self.squat_down_angle = angles.get("down", self.squat_down_angle)
+
+    def _apply_default_angles(self, exercise: str):
+        if exercise == "bicep_curls":
+            self.arm_extended_angle = self.BICEP_CANONICAL["extended"]
+            self.arm_contracted_angle = self.BICEP_CANONICAL["contracted"]
+        elif exercise == "squats":
+            self.squat_up_angle = self.SQUAT_CANONICAL["up"]
+            self.squat_down_angle = self.SQUAT_CANONICAL["down"]
+
+    def _finalize_bicep_calibration(self, mode: str, critic: float) -> Dict[str, Any]:
+        if not self.pending_calibration:
+            raise RuntimeError("No pending calibration to finalize.")
+        angles = {
+            "extended": float(self.pending_calibration["extended_angle"]),
+            "contracted": float(self.last_right_elbow_angle),
+        }
+        canonical = self.BICEP_CANONICAL
+        eta = {
+            "extended": (angles["extended"] - canonical["extended"]) / canonical["extended"],
+            "contracted": (angles["contracted"] - canonical["contracted"]) / canonical["contracted"],
+        }
+        record = new_record(
+            exercise="bicep_curls",
+            mode=mode,
+            angles=angles,
+            eta=eta,
+            canonical=canonical,
+            critic=critic,
+            images={
+                "extended": self.pending_calibration.get("extended_image"),
+                "contracted": self._capture_snapshot(),
+            },
+        )
+        store.add_record(record)
+        self.pending_calibration = None
+        self._apply_record(record)
+        return record.to_dict()
+
+    def _finalize_squat_calibration(self, mode: str, critic: float) -> Dict[str, Any]:
+        if not self.pending_calibration:
+            raise RuntimeError("No pending calibration to finalize.")
+        angles = {
+            "up": float(self.pending_calibration["up_angle"]),
+            "down": float(self.last_right_knee_angle),
+        }
+        canonical = self.SQUAT_CANONICAL
+        eta = {
+            "up": (angles["up"] - canonical["up"]) / canonical["up"],
+            "down": (angles["down"] - canonical["down"]) / canonical["down"],
+        }
+        record = new_record(
+            exercise="squats",
+            mode=mode,
+            angles=angles,
+            eta=eta,
+            canonical=canonical,
+            critic=critic,
+            images={
+                "up": self.pending_calibration.get("up_image"),
+                "down": self._capture_snapshot(),
+            },
+        )
+        store.add_record(record)
+        self.pending_calibration = None
+        self._apply_record(record)
+        return record.to_dict()
 
     def handle_command(self, command_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         command = command_data.get("command")
-        exercise = command_data.get("exercise")
-        if exercise:
-            self.selected_exercise = exercise
+        exercise = command_data.get("exercise") or self.selected_exercise or "bicep_curls"
+        self.selected_exercise = exercise
 
         if command == "select_exercise":
-            return None
+            self.pending_calibration = None
+            return {
+                "event": "exercise_selected",
+                "exercise": exercise,
+                "mode": self.current_mode,
+                **store.to_summary(exercise),
+            }
+
+        if command == "set_mode":
+            mode = command_data.get("mode", "common")
+            if mode not in ("common", "calibration"):
+                mode = "common"
+            self.current_mode = mode
+            if mode == "common":
+                self.pending_calibration = None
+            active = store.get_active_record(exercise, mode)
+            if active:
+                self._apply_record(active)
+            return {
+                "event": "mode_updated",
+                "exercise": exercise,
+                "mode": mode,
+                "activeCalibration": active,
+                "critics": store.get_critics(exercise),
+            }
+
+        if command == "set_critic":
+            mode = command_data.get("mode", "common")
+            value = float(command_data.get("value", 0.2))
+            store.set_critic(exercise, mode, value)
+            return {
+                "event": "critic_updated",
+                "exercise": exercise,
+                "mode": mode,
+                "critics": store.get_critics(exercise),
+            }
+
+        if command == "list_calibrations":
+            return {
+                "event": "calibration_list",
+                "exercise": exercise,
+                "mode": self.current_mode,
+                **store.to_summary(exercise),
+            }
+
+        if command == "use_calibration":
+            mode = command_data.get("mode", "common")
+            record_id = command_data.get("record_id")
+            if record_id:
+                store.set_active_record(exercise, mode, record_id)
+                record = store.get_active_record(exercise, mode)
+                if record:
+                    self._apply_record(record)
+            else:
+                store.set_active_record(exercise, mode, None)
+                self._apply_default_angles(exercise)
+                record = None
+            return {
+                "event": "calibration_applied",
+                "exercise": exercise,
+                "mode": mode,
+                "activeCalibration": record,
+            }
+
+        if command == "delete_calibration":
+            record_id = command_data.get("record_id")
+            deleted_record = None
+            if record_id:
+                for entry in store.list_records(exercise):
+                    if entry["id"] == record_id:
+                        deleted_record = entry
+                        break
+                store.delete_record(exercise, record_id)
+            if deleted_record and deleted_record.get("mode") == self.current_mode:
+                active = store.get_active_record(exercise, self.current_mode)
+                if active:
+                    self._apply_record(active)
+                else:
+                    self._apply_default_angles(exercise)
+            summary = store.to_summary(exercise)
+            return {
+                "event": "calibration_deleted",
+                "exercise": exercise,
+                "deleted_id": record_id,
+                **summary,
+            }
 
         if command == "calibrate_down":
             self.arm_extended_angle = self.last_right_elbow_angle
-            if self.world_landmarks is not None:
-                shoulder = np.array(
-                    self.world_landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-                )
-                elbow = np.array(
-                    self.world_landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW.value]
-                )
-                self.user_profile["upper_arm_length"] = np.linalg.norm(shoulder - elbow)
-            self.logger.info(
-                "Calibrated DOWN angle to: %.2f (arm length %.4f)",
-                self.arm_extended_angle,
-                self.user_profile.get("upper_arm_length") or 0.0,
-            )
-        elif command == "calibrate_up":
+            self.pending_calibration = {
+                "exercise": "bicep_curls",
+                "mode": self.current_mode,
+                "extended_angle": self.arm_extended_angle,
+                "extended_image": self._capture_snapshot(),
+            }
+            return {
+                "event": "calibration_stage",
+                "stage": "extended",
+                "exercise": "bicep_curls",
+                "mode": self.current_mode,
+                "angles": {"extended": self.arm_extended_angle},
+            }
+
+        if command == "calibrate_up":
             self.arm_contracted_angle = self.last_right_elbow_angle
-            self.logger.info("Calibrated UP angle to: %.2f", self.arm_contracted_angle)
-        elif command == "calibrate_squat_down":
-            self.squat_down_angle = self.last_right_knee_angle
-            self.logger.info(
-                "Calibrated SQUAT DOWN angle to: %.2f", self.squat_down_angle
-            )
-        elif command == "calibrate_squat_up":
+            critic = store.get_critics("bicep_curls")[self.current_mode]
+            record = self._finalize_bicep_calibration(self.current_mode, critic)
+            return {
+                "event": "calibration_complete",
+                "exercise": "bicep_curls",
+                "mode": self.current_mode,
+                "record": record,
+            }
+
+        if command == "calibrate_squat_up":
             self.squat_up_angle = self.last_right_knee_angle
-            if self.world_landmarks is not None:
-                hip = np.array(
-                    self.world_landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
-                )
-                knee = np.array(
-                    self.world_landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE.value]
-                )
-                self.user_profile["thigh_length"] = np.linalg.norm(hip - knee)
-            self.logger.info(
-                "Calibrated SQUAT UP angle to: %.2f (thigh length %.4f)",
-                self.squat_up_angle,
-                self.user_profile.get("thigh_length") or 0.0,
-            )
-        elif command == "reset":
+            self.pending_calibration = {
+                "exercise": "squats",
+                "mode": self.current_mode,
+                "up_angle": self.squat_up_angle,
+                "up_image": self._capture_snapshot(),
+            }
+            return {
+                "event": "calibration_stage",
+                "stage": "up",
+                "exercise": "squats",
+                "mode": self.current_mode,
+                "angles": {"up": self.squat_up_angle},
+            }
+
+        if command == "calibrate_squat_down":
+            self.squat_down_angle = self.last_right_knee_angle
+            critic = store.get_critics("squats")[self.current_mode]
+            record = self._finalize_squat_calibration(self.current_mode, critic)
+            return {
+                "event": "calibration_complete",
+                "exercise": "squats",
+                "mode": self.current_mode,
+                "record": record,
+            }
+
+        if command == "reset":
             summary = {"total_reps": self.total_reps, "mistakes": self.mistake_counter}
             self.reset_state(reset_calibration=False)
             return {"summary": summary}
@@ -129,6 +356,7 @@ class MediaPipe3DBackend(PoseBackend):
         return coords
 
     def process_frame(self, frame_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+        self.last_frame_bgr = frame_bgr.copy()
         img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         results = self.holistic.process(img_rgb)
 
@@ -201,35 +429,11 @@ class MediaPipe3DBackend(PoseBackend):
                 else 1.0
             )
 
-        required_landmarks = [
-            mp_pose.PoseLandmark.LEFT_SHOULDER,
-            mp_pose.PoseLandmark.RIGHT_SHOULDER,
-            mp_pose.PoseLandmark.LEFT_HIP,
-            mp_pose.PoseLandmark.RIGHT_HIP,
-        ]
-        if self.selected_exercise == "bicep_curls":
-            required_landmarks.extend(
-                [
-                    mp_pose.PoseLandmark.LEFT_ELBOW,
-                    mp_pose.PoseLandmark.RIGHT_ELBOW,
-                    mp_pose.PoseLandmark.LEFT_WRIST,
-                    mp_pose.PoseLandmark.RIGHT_WRIST,
-                ]
-            )
-        elif self.selected_exercise == "squats":
-            required_landmarks.extend(
-                [
-                    mp_pose.PoseLandmark.LEFT_KNEE,
-                    mp_pose.PoseLandmark.RIGHT_KNEE,
-                    mp_pose.PoseLandmark.LEFT_ANKLE,
-                    mp_pose.PoseLandmark.RIGHT_ANKLE,
-                ]
-            )
+        required_indices = self._required_joints(self.selected_exercise)
+        essential_visible = all(visible(idx) >= 0.1 for idx in required_indices)
 
-        is_occluded = any(visible(lm.value) < 0.7 for lm in required_landmarks)
-
-        if is_occluded:
-            feedback = "Adjust camera to show full body"
+        if not essential_visible:
+            feedback = "Adjust camera to show the active limb"
         else:
             right_elbow_position_2d = image_landmarks[
                 mp_pose.PoseLandmark.RIGHT_ELBOW.value
@@ -245,6 +449,7 @@ class MediaPipe3DBackend(PoseBackend):
             elif self.curl_state == "UP":
                 if right_elbow_angle > (self.arm_extended_angle - 20):
                     self.curl_state = "DOWN"
+                    print("Registered curl rep")
                     self.curl_counter += 1
                     self.total_reps += 1
                     feedback = ""

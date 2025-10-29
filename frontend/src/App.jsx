@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 // import Avatar from './Avatar'; // Disabled - avatar.glb missing
 import AROverlay from './AROverlay';
 import './App.css';
@@ -16,6 +16,23 @@ const EXERCISES = [
   }
 ];
 
+const CANONICAL_BASELINES = {
+  bicep_curls: {
+    extended: 160,
+    contracted: 30,
+  },
+  squats: {
+    up: 160,
+    down: 50,
+  },
+};
+
+const createDefaultSummary = () => ({
+  records: [],
+  active: { common: null, calibration: null },
+  critics: { common: 0.2, calibration: 0.2 }
+});
+
 function App() {
   const [isMediaPipeReady, setIsMediaPipeReady] = useState(false);
   const [status, setStatus] = useState('Loading MediaPipe libraries...');
@@ -28,19 +45,159 @@ function App() {
   const [llmFeedback, setLlmFeedback] = useState('');
   const [feedbackLandmarks, setFeedbackLandmarks] = useState([]);
   const [poseLandmarks, setPoseLandmarks] = useState([]); // State to hold landmarks for the 3D avatar
-  const [appState, setAppState] = useState('selection'); // 'selection', 'calibrating_down', 'calibrating_up', 'workout', 'summary'
+  const [appState, setAppState] = useState('selection'); // 'selection', 'calibrating_down', 'calibrating_up', 'calibration_saving', 'workout', 'summary'
   const [workoutSummary, setWorkoutSummary] = useState(null);
   const [selectedExercise, setSelectedExercise] = useState(null);
   const [countdown, setCountdown] = useState(null);
   const [latencyMs, setLatencyMs] = useState(null);
   const [roundTripMs, setRoundTripMs] = useState(null);
+  const [backendName, setBackendName] = useState(null);
+  const [appMode, setAppMode] = useState('common');
+  const [calibrationSummary, setCalibrationSummary] = useState({});
+  const [selectedRecordId, setSelectedRecordId] = useState(null);
+  const [criticInputs, setCriticInputs] = useState({ common: '0.200', calibration: '0.200' });
+  const [latestCalibration, setLatestCalibration] = useState(null);
+  const [showCalibrationManager, setShowCalibrationManager] = useState(false);
+  const appModeRef = useRef(appMode);
+  const showCalibrationManagerRef = useRef(showCalibrationManager);
+  const selectedRecordIdRef = useRef(selectedRecordId);
   const countdownIntervalId = useRef(null);
+  const calibrationTimeoutId = useRef(null);
+  const latestCalibrationRef = useRef(null);
   const videoRef = useRef(null);
   const canvasRef = useRef(null); // For sending frames
   const ws = useRef(null);
   const frameSenderIntervalId = useRef(null);
   const selectedExerciseRef = useRef(null);
   const awaitingResponseRef = useRef(false);
+
+  const sendCommand = useCallback((payload) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    const message = { ...payload };
+    if (!message.exercise) {
+      message.exercise = selectedExerciseRef.current;
+    }
+    ws.current.send(JSON.stringify(message));
+  }, []);
+
+  const updateSummary = useCallback((exercise, updater) => {
+    setCalibrationSummary(prev => {
+      const prevInfo = prev[exercise] ? { ...prev[exercise] } : createDefaultSummary();
+      const nextInfo = updater(prevInfo);
+      return { ...prev, [exercise]: nextInfo };
+    });
+  }, []);
+
+  const resetMetrics = useCallback(() => {
+    setWorkoutSummary(null);
+    setRepCounter(0);
+    setFeedbackMessage('');
+    setLlmFeedback('');
+    setFeedbackLandmarks([]);
+    setPoseLandmarks([]);
+    setLeftElbowAngle(null);
+    setRightElbowAngle(null);
+    setLeftKneeAngle(null);
+    setRightKneeAngle(null);
+    setLatencyMs(null);
+    setRoundTripMs(null);
+    awaitingResponseRef.current = false;
+    setBackendName(null);
+  }, []);
+
+  const handleCriticChange = useCallback((mode, value) => {
+    setCriticInputs(prev => ({ ...prev, [mode]: value }));
+  }, []);
+
+  const handleCriticSubmit = useCallback((mode) => {
+    const value = parseFloat(criticInputs[mode]);
+    if (!Number.isFinite(value)) return;
+    sendCommand({ command: 'set_critic', mode, value });
+  }, [criticInputs, sendCommand]);
+
+  const handleDeleteCalibration = useCallback((recordId) => {
+    if (!recordId || !selectedExerciseRef.current) return;
+    sendCommand({
+      command: 'delete_calibration',
+      exercise: selectedExerciseRef.current,
+      record_id: recordId,
+    });
+  }, [sendCommand]);
+
+  const handleUseDefault = useCallback((mode) => {
+    if (!selectedExerciseRef.current) return;
+    sendCommand({
+      command: 'use_calibration',
+      exercise: selectedExerciseRef.current,
+      record_id: null,
+      mode,
+    });
+  }, [sendCommand]);
+
+  useEffect(() => {
+    const summary = selectedExercise ? (calibrationSummary[selectedExercise] || createDefaultSummary()) : createDefaultSummary();
+    const critics = summary.critics || { common: 0.2, calibration: 0.2 };
+    setCriticInputs({
+      common: Number(critics.common ?? 0.2).toFixed(3),
+      calibration: Number(critics.calibration ?? 0.2).toFixed(3),
+    });
+  }, [selectedExercise, calibrationSummary]);
+
+  useEffect(() => {
+    if (!selectedExercise) return;
+    const summary = calibrationSummary[selectedExercise];
+    if (!summary) return;
+    if (showCalibrationManager) {
+      if (selectedRecordId && !summary.records.some(r => r.id === selectedRecordId)) {
+        const fallbackRecord = summary.records[0] ? summary.records[0].id : null;
+        selectedRecordIdRef.current = fallbackRecord;
+        setSelectedRecordId(fallbackRecord);
+      } else if (!selectedRecordId && summary.records.length) {
+        selectedRecordIdRef.current = summary.records[0].id;
+        setSelectedRecordId(summary.records[0].id);
+      }
+    } else if (selectedRecordId !== null) {
+      selectedRecordIdRef.current = null;
+      setSelectedRecordId(null);
+    }
+  }, [selectedExercise, calibrationSummary, selectedRecordId, showCalibrationManager]);
+
+  const currentSummary = selectedExercise ? (calibrationSummary[selectedExercise] || createDefaultSummary()) : createDefaultSummary();
+  const currentRecords = currentSummary.records || [];
+  const activeCommonId = currentSummary.active ? currentSummary.active.common : null;
+  const activeCalibrationId = currentSummary.active ? currentSummary.active.calibration : null;
+  const workoutRecord = currentRecords.find(r => r.id === activeCommonId) || null;
+  const calibrationRecord = currentRecords.find(r => r.id === activeCalibrationId) || null;
+  const selectedRecord = showCalibrationManager
+    ? currentRecords.find(r => r.id === selectedRecordId) || null
+    : null;
+  const latestEta = latestCalibration && latestCalibration.record ? latestCalibration.record.eta : null;
+  const showLatestCalibration = latestCalibration && latestCalibration.exercise === selectedExercise;
+  const canonicalBaseline = selectedExercise ? CANONICAL_BASELINES[selectedExercise] || null : null;
+  const usingDefaultWorkout = !workoutRecord;
+  const usingDefaultCalibration = !calibrationRecord;
+  const workoutBaselineLabel = usingDefaultWorkout || !workoutRecord
+    ? 'Default canonical angles'
+    : `Personalized capture on ${new Date(workoutRecord.timestamp).toLocaleString()}`;
+  const calibrationBaselineLabel = usingDefaultCalibration || !calibrationRecord
+    ? 'Default canonical angles'
+    : `Personalized capture on ${new Date(calibrationRecord.timestamp).toLocaleString()}`;
+
+  useEffect(() => {
+    showCalibrationManagerRef.current = showCalibrationManager;
+  }, [showCalibrationManager]);
+
+  useEffect(() => {
+    selectedRecordIdRef.current = selectedRecordId;
+  }, [selectedRecordId]);
+
+  useEffect(() => {
+    appModeRef.current = appMode;
+  }, [appMode]);
+
+  useEffect(() => {
+    latestCalibrationRef.current = latestCalibration;
+  }, [latestCalibration]);
 
   // Effect to check for MediaPipe libraries
   useEffect(() => {
@@ -53,95 +210,312 @@ function App() {
     return () => clearInterval(mediaPipeCheckInterval);
   }, []);
 
-  // Effect for WebSocket, Camera, and Drawing, when calibrating or working out
+  // Maintain a WebSocket connection once MediaPipe is ready
   useEffect(() => {
-    if (isMediaPipeReady && (appState === 'calibrating_down' || appState === 'calibrating_up' || appState === 'workout')) {
-      // Only establish connection if it doesn't exist or is closed
-      if (!ws.current || ws.current.readyState === WebSocket.CLOSED) {
-        setStatus('Connecting to server...');
-        ws.current = new WebSocket('ws://localhost:8001/ws');
+    if (!isMediaPipeReady) return undefined;
 
-        ws.current.onopen = () => {
-          setStatus('Connected. Starting camera...');
-          if (selectedExerciseRef.current) {
-            ws.current.send(JSON.stringify({ command: 'select_exercise', exercise: selectedExerciseRef.current }));
-          }
-        };
-        ws.current.onclose = () => {
-          awaitingResponseRef.current = false;
-          setStatus('Disconnected.');
-        };
-        ws.current.onmessage = (event) => {
-          awaitingResponseRef.current = false;
-          const data = JSON.parse(event.data);
+    let cancelled = false;
+    let reconnectTimer = null;
 
-          // Handle summary message
-          if (data.summary) {
-            setWorkoutSummary(data.summary);
-            return; // Stop processing after handling summary
-          }
-
-          // Handle regular landmark and feedback messages
-          if (data.landmarks) {
-            const currentExercise = selectedExerciseRef.current;
-            if (currentExercise === 'squats') {
-              if (data.hasOwnProperty('squat_counter')) setRepCounter(data.squat_counter);
-            } else {
-              if (data.hasOwnProperty('curl_counter')) {
-                setRepCounter(data.curl_counter);
-              } else if (data.hasOwnProperty('squat_counter')) {
-                // Fallback in case backend only sends squat counter
-                setRepCounter(data.squat_counter);
-              }
-            }
-            if (data.hasOwnProperty('latency_ms')) setLatencyMs(data.latency_ms);
-            if (data.hasOwnProperty('client_ts')) {
-              const rtt = performance.now() - data.client_ts;
-              if (Number.isFinite(rtt)) setRoundTripMs(rtt);
-            }
-            if (data.left_knee_angle) setLeftKneeAngle(data.left_knee_angle.toFixed(2));
-            if (data.right_knee_angle) setRightKneeAngle(data.right_knee_angle.toFixed(2));
-            if (data.left_elbow_angle) setLeftElbowAngle(data.left_elbow_angle.toFixed(2));
-            if (data.right_elbow_angle) setRightElbowAngle(data.right_elbow_angle.toFixed(2));
-            if (data.feedback) setFeedbackMessage(data.feedback);
-            if (data.llm_feedback) setLlmFeedback(data.llm_feedback);
-            if (data.feedback_landmarks) setFeedbackLandmarks(data.feedback_landmarks);
-
-            // Update the pose landmarks for the 3D avatar
-            setPoseLandmarks(data.landmarks);
-          }
-        };
+    const ensureConnection = () => {
+      if (cancelled) return;
+      if (ws.current && ws.current.readyState !== WebSocket.CLOSED) {
+        return;
       }
 
-      // Always try to start the camera if it's not already running
-      if (!videoRef.current.srcObject) {
-        const startCamera = async () => {
-          try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-            if (videoRef.current) {
-              videoRef.current.srcObject = stream;
-            }
-          } catch (err) {
-            console.error('Error accessing camera:', err);
-            setStatus('Error: Could not access camera.');
-          }
-        };
-        startCamera();
-      }
+      setStatus('Connecting to server...');
+      const socket = new WebSocket('ws://localhost:8001/ws');
+      ws.current = socket;
 
-      // Cleanup function for this effect
-      return () => {
-        clearInterval(frameSenderIntervalId.current);
-        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          ws.current.close();
-        }
-        if (videoRef.current?.srcObject) {
-          videoRef.current.srcObject.getTracks().forEach(track => track.stop());
-          videoRef.current.srcObject = null;
+      socket.onopen = () => {
+        if (cancelled) return;
+        setStatus('Connected. Ready for actions.');
+        awaitingResponseRef.current = false;
+        if (selectedExerciseRef.current) {
+          socket.send(JSON.stringify({ command: 'select_exercise', exercise: selectedExerciseRef.current }));
+          socket.send(JSON.stringify({ command: 'list_calibrations', exercise: selectedExerciseRef.current }));
+          socket.send(JSON.stringify({ command: 'set_mode', mode: appModeRef.current, exercise: selectedExerciseRef.current }));
         }
       };
+
+      socket.onclose = () => {
+        awaitingResponseRef.current = false;
+        if (cancelled) return;
+        setStatus('Disconnected. Retrying...');
+        ws.current = null;
+        reconnectTimer = setTimeout(ensureConnection, 1500);
+      };
+
+      socket.onerror = () => {
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+      };
+
+      socket.onmessage = (event) => {
+        awaitingResponseRef.current = false;
+        const showManager = showCalibrationManagerRef.current;
+        const currentSelectedId = selectedRecordIdRef.current;
+        const data = JSON.parse(event.data);
+
+        if (data.event) {
+          const eventType = data.event;
+          if (eventType === 'exercise_selected') {
+            const exercise = data.exercise;
+            updateSummary(exercise, () => ({
+              records: data.records || [],
+              active: data.active || { common: null, calibration: null },
+              critics: data.critics || { common: 0.2, calibration: 0.2 }
+            }));
+            if (data.mode) setAppMode(data.mode);
+            return;
+          }
+          if (eventType === 'mode_updated') {
+            const exercise = data.exercise;
+            setAppMode(data.mode);
+            if (data.activeCalibration) {
+              selectedRecordIdRef.current = data.activeCalibration.id || null;
+              setSelectedRecordId(data.activeCalibration.id || null);
+            }
+            if (data.critics) {
+              updateSummary(exercise, prev => ({
+                ...prev,
+                critics: data.critics,
+                active: prev.active || { common: null, calibration: null }
+              }));
+            }
+            return;
+          }
+          if (eventType === 'critic_updated') {
+            const exercise = data.exercise;
+            updateSummary(exercise, prev => ({
+              ...prev,
+              critics: data.critics || prev.critics
+            }));
+            return;
+          }
+          if (eventType === 'calibration_list') {
+            const exercise = data.exercise;
+            updateSummary(exercise, () => ({
+              records: data.records || [],
+              active: data.active || { common: null, calibration: null },
+              critics: data.critics || { common: 0.2, calibration: 0.2 }
+            }));
+            if (exercise === selectedExerciseRef.current) {
+              const active = data.active || {};
+              const records = data.records || [];
+              const fallback = showManager ? (active.calibration || active.common) : (active.common || active.calibration);
+              let nextId = fallback || null;
+              if (!nextId) {
+                if (currentSelectedId && records.some(r => r.id === currentSelectedId)) {
+                  nextId = currentSelectedId;
+                } else if (currentSelectedId === null) {
+                  nextId = null;
+                } else if (records.length) {
+                  nextId = records[0].id;
+                }
+              }
+              if (nextId !== currentSelectedId) {
+                selectedRecordIdRef.current = nextId;
+                setSelectedRecordId(nextId);
+              }
+            }
+            return;
+          }
+          if (eventType === 'calibration_applied') {
+            const exercise = data.exercise;
+            updateSummary(exercise, prev => ({
+              ...prev,
+              active: {
+                ...prev.active,
+                [data.mode]: data.activeCalibration ? data.activeCalibration.id : null
+              }
+            }));
+            if (data.activeCalibration) {
+              selectedRecordIdRef.current = data.activeCalibration.id;
+              setSelectedRecordId(data.activeCalibration.id);
+            } else {
+              if (data.mode === 'common' && !showManager) {
+                selectedRecordIdRef.current = null;
+                setSelectedRecordId(null);
+              }
+              if (data.mode === 'calibration' && showManager) {
+                selectedRecordIdRef.current = null;
+                setSelectedRecordId(null);
+              }
+            }
+            return;
+          }
+          if (eventType === 'calibration_deleted') {
+            const exercise = data.exercise;
+            updateSummary(exercise, () => ({
+              records: data.records || [],
+              active: data.active || { common: null, calibration: null },
+              critics: data.critics || { common: 0.2, calibration: 0.2 }
+            }));
+            if (exercise === selectedExerciseRef.current) {
+              const active = data.active || {};
+              const fallback = showManager ? (active.calibration || active.common) : (active.common || active.calibration);
+              const firstRecord = data.records && data.records.length ? data.records[0].id : null;
+              const nextId = fallback || firstRecord || null;
+              if (nextId !== currentSelectedId) {
+                selectedRecordIdRef.current = nextId;
+                setSelectedRecordId(nextId);
+              }
+              const latest = latestCalibrationRef.current;
+              if (latest && latest.record && latest.record.id === data.deleted_id) {
+                latestCalibrationRef.current = null;
+                setLatestCalibration(null);
+              }
+              setStatus('Calibration deleted.');
+            }
+            return;
+          }
+          if (eventType === 'calibration_stage') {
+            if (data.stage === 'extended') {
+              setStatus('Captured extended pose. Record contracted angle next.');
+            } else if (data.stage === 'up') {
+              setStatus('Captured standing pose. Record squat depth next.');
+            }
+            return;
+          }
+          if (eventType === 'calibration_complete') {
+            const exercise = data.exercise;
+            const record = data.record;
+            if (record) {
+              updateSummary(exercise, prev => {
+                const existing = prev.records.filter(r => r.id !== record.id);
+                return {
+                  ...prev,
+                  records: [record, ...existing],
+                  active: {
+                    ...prev.active,
+                    [data.mode]: record.id
+                  }
+                };
+              });
+              const latestPayload = { exercise, record };
+              latestCalibrationRef.current = latestPayload;
+              setLatestCalibration(latestPayload);
+              selectedRecordIdRef.current = record.id;
+              setSelectedRecordId(record.id);
+              showCalibrationManagerRef.current = true;
+              setShowCalibrationManager(true);
+              setAppMode('common');
+              setAppState('selection');
+              setStatus('Calibration saved. Review it in Manage Calibrations or begin a workout.');
+              sendCommand({ command: 'set_mode', mode: 'common', exercise });
+              sendCommand({ command: 'list_calibrations', exercise });
+            }
+            return;
+          }
+          if (eventType === 'calibration_error') {
+            if (data.message) setStatus(`Calibration error: ${data.message}`);
+            setAppState('selection');
+            return;
+          }
+          return;
+        }
+
+        // Handle summary message
+        if (data.summary) {
+          setWorkoutSummary(data.summary);
+          return; // Stop processing after handling summary
+        }
+
+        // Handle regular landmark and feedback messages
+        if (data.backend) setBackendName(data.backend);
+
+        if (data.landmarks) {
+          const currentExercise = selectedExerciseRef.current;
+          if (currentExercise === 'squats') {
+            if (data.hasOwnProperty('squat_counter')) setRepCounter(data.squat_counter);
+          } else {
+            if (data.hasOwnProperty('curl_counter')) {
+              setRepCounter(data.curl_counter);
+            } else if (data.hasOwnProperty('squat_counter')) {
+              // Fallback in case backend only sends squat counter
+              setRepCounter(data.squat_counter);
+            }
+          }
+          if (data.hasOwnProperty('latency_ms')) setLatencyMs(data.latency_ms);
+          if (data.hasOwnProperty('client_ts')) {
+            const rtt = performance.now() - data.client_ts;
+            if (Number.isFinite(rtt)) setRoundTripMs(rtt);
+          }
+          if (data.left_knee_angle) setLeftKneeAngle(data.left_knee_angle.toFixed(2));
+          if (data.right_knee_angle) setRightKneeAngle(data.right_knee_angle.toFixed(2));
+          if (data.left_elbow_angle) setLeftElbowAngle(data.left_elbow_angle.toFixed(2));
+          if (data.right_elbow_angle) setRightElbowAngle(data.right_elbow_angle.toFixed(2));
+          if (data.feedback) setFeedbackMessage(data.feedback);
+          if (data.llm_feedback) setLlmFeedback(data.llm_feedback);
+          if (data.feedback_landmarks) setFeedbackLandmarks(data.feedback_landmarks);
+
+          // Update the pose landmarks for the 3D avatar
+          setPoseLandmarks(data.landmarks);
+        }
+      };
+    };
+
+    ensureConnection();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      if (ws.current) {
+        ws.current.close();
+        ws.current = null;
+      }
+    };
+  }, [isMediaPipeReady, updateSummary, sendCommand]);
+
+  // Manage camera lifecycle separately from the WebSocket
+  useEffect(() => {
+    if (!isMediaPipeReady) return;
+    const streamingStates = ['calibrating_down', 'calibrating_up', 'workout'];
+    const shouldStream = streamingStates.includes(appState);
+
+    if (!shouldStream) {
+      clearInterval(frameSenderIntervalId.current);
+      awaitingResponseRef.current = false;
+      if (videoRef.current?.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+      return;
     }
-  }, [isMediaPipeReady, appState]);
+
+    if (!videoRef.current?.srcObject) {
+      const startCamera = async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+          }
+        } catch (err) {
+          console.error('Error accessing camera:', err);
+          setStatus('Error: Could not access camera.');
+        }
+      };
+      startCamera();
+    }
+  }, [appState, isMediaPipeReady]);
+
+  useEffect(() => {
+    return () => {
+      clearInterval(frameSenderIntervalId.current);
+      if (videoRef.current?.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+      if (calibrationTimeoutId.current) {
+        clearTimeout(calibrationTimeoutId.current);
+        calibrationTimeoutId.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     selectedExerciseRef.current = selectedExercise;
@@ -184,48 +558,65 @@ function App() {
     }, 1000 / 30);
   };
 
-  const prepareForNewSession = (exercise) => {
+  const handleSelectExercise = (exercise) => {
+    if (selectedExerciseRef.current !== exercise) {
+      resetMetrics();
+      latestCalibrationRef.current = null;
+      setLatestCalibration(null);
+      setSelectedRecordId(null);
+      selectedRecordIdRef.current = null;
+      showCalibrationManagerRef.current = false;
+      setShowCalibrationManager(false);
+    }
     setSelectedExercise(exercise);
-    setWorkoutSummary(null);
-    setRepCounter(0);
-    setFeedbackMessage('');
-    setLlmFeedback('');
-    setFeedbackLandmarks([]);
-    setPoseLandmarks([]);
-    setLeftElbowAngle(null);
-    setRightElbowAngle(null);
-    setLeftKneeAngle(null);
-    setRightKneeAngle(null);
-    setLatencyMs(null);
-    setRoundTripMs(null);
+    selectedExerciseRef.current = exercise;
+    setStatus(`Selected ${EXERCISES.find(e => e.id === exercise)?.label || exercise}. Choose an action below.`);
+    sendCommand({ command: 'select_exercise', exercise });
+    sendCommand({ command: 'list_calibrations', exercise });
   };
 
-  const startCalibration = (exercise) => {
-    prepareForNewSession(exercise);
-    setAppState('calibrating_down');
-  };
-
-  const startWorkoutWithoutCalibration = (exercise) => {
-    prepareForNewSession(exercise);
+  const beginWorkout = () => {
+    if (!selectedExerciseRef.current) {
+      setStatus('Select an exercise before starting.');
+      return;
+    }
+    resetMetrics();
+    const exercise = selectedExerciseRef.current;
+    setAppMode('common');
+    showCalibrationManagerRef.current = false;
+    setShowCalibrationManager(false);
+    sendCommand({ command: 'set_mode', mode: 'common', exercise });
     setAppState('workout');
+    setStatus('Workout started. Perform reps while watching the overlay.');
+  };
+
+  const beginCalibration = () => {
+    if (!selectedExerciseRef.current) {
+      setStatus('Select an exercise before capturing a calibration.');
+      return;
+    }
+    resetMetrics();
+    const exercise = selectedExerciseRef.current;
+    setAppMode('calibration');
+    showCalibrationManagerRef.current = false;
+    setShowCalibrationManager(false);
+    sendCommand({ command: 'set_mode', mode: 'calibration', exercise });
+    setAppState('calibrating_down');
+    setStatus('Calibration: hold the prompted pose when the countdown finishes.');
   };
 
   const resetApp = () => {
     setAppState('selection');
-    setWorkoutSummary(null);
-    setRepCounter(0);
-    setFeedbackMessage('');
-    setLlmFeedback('');
-    setLeftElbowAngle(null);
-    setRightElbowAngle(null);
-    setLeftKneeAngle(null);
-    setRightKneeAngle(null);
+    resetMetrics();
     setSelectedExercise(null);
-    setFeedbackLandmarks([]);
-    setPoseLandmarks([]);
-    setLatencyMs(null);
-    setRoundTripMs(null);
-    awaitingResponseRef.current = false;
+    selectedExerciseRef.current = null;
+    setAppMode('common');
+    selectedRecordIdRef.current = null;
+    setSelectedRecordId(null);
+    latestCalibrationRef.current = null;
+    setLatestCalibration(null);
+    showCalibrationManagerRef.current = false;
+    setShowCalibrationManager(false);
   };
 
   const endWorkout = () => {
@@ -235,23 +626,54 @@ function App() {
     setAppState('summary');
   };
 
+  const cancelCalibration = useCallback(() => {
+    clearInterval(countdownIntervalId.current);
+    countdownIntervalId.current = null;
+    if (calibrationTimeoutId.current) {
+      clearTimeout(calibrationTimeoutId.current);
+      calibrationTimeoutId.current = null;
+    }
+    setCountdown(null);
+    if (!selectedExerciseRef.current) {
+      setAppState('selection');
+      setStatus('Calibration cancelled.');
+      return;
+    }
+    const exercise = selectedExerciseRef.current;
+    setAppMode('common');
+    appModeRef.current = 'common';
+    showCalibrationManagerRef.current = false;
+    setShowCalibrationManager(false);
+    setAppState('selection');
+    setStatus('Calibration cancelled. Choose an action to continue.');
+    sendCommand({ command: 'set_mode', mode: 'common', exercise });
+  }, [sendCommand]);
+
   const recordCalibration = (step) => {
+    const exercise = selectedExerciseRef.current;
+    if (!exercise) {
+      setStatus('Select an exercise before capturing a calibration.');
+      return;
+    }
     setCountdown(3);
     countdownIntervalId.current = setInterval(() => {
       setCountdown(prev => prev - 1);
     }, 1000);
 
-    setTimeout(() => {
+    if (calibrationTimeoutId.current) {
+      clearTimeout(calibrationTimeoutId.current);
+    }
+    calibrationTimeoutId.current = setTimeout(() => {
       clearInterval(countdownIntervalId.current);
-      if (ws.current?.readyState === WebSocket.OPEN) {
-        ws.current.send(JSON.stringify({ command: `calibrate_${step}`, exercise: selectedExercise }));
-      }
+      sendCommand({ command: `calibrate_${step}`, exercise });
       if (step === 'down' || step === 'squat_up') {
         setAppState('calibrating_up');
       } else {
-        setAppState('workout');
+        setAppState('calibration_saving');
+        setStatus('Saving calibration snapshot...');
       }
       setCountdown(null);
+      calibrationTimeoutId.current = null;
     }, 3000);
   };
 
@@ -260,10 +682,227 @@ function App() {
       <h1>FitCoachAR</h1>
       <p className="subtitle">Real-Time Adaptive Exercise Coaching via Pose Estimation and AR Feedback</p>
       <p>Status: {status}</p>
+      {backendName && <p>Backend: {backendName}</p>}
       {latencyMs !== null && <p>Backend latency: {latencyMs.toFixed(1)} ms</p>}
       {roundTripMs !== null && <p>Total latency: {roundTripMs.toFixed(1)} ms</p>}
-      {latencyMs !== null && <p>Latency: {latencyMs.toFixed(1)} ms</p>}
-
+      <div className="action-bar">
+        <button onClick={beginWorkout} disabled={!selectedExercise}>Begin Workout</button>
+        <button onClick={beginCalibration} disabled={!selectedExercise}>New Calibration</button>
+        <button
+          onClick={() => {
+            if (!selectedExerciseRef.current) return;
+            const next = !showCalibrationManager;
+            showCalibrationManagerRef.current = next;
+            setShowCalibrationManager(next);
+            if (next) {
+              sendCommand({ command: 'list_calibrations', exercise: selectedExerciseRef.current });
+            }
+          }}
+          disabled={!selectedExercise}
+        >
+          {showCalibrationManager ? 'Hide Calibrations' : 'Manage Calibrations'}
+        </button>
+      </div>
+      {showLatestCalibration && latestEta && (
+        <div className="calibration-summary-panel">
+          <h3>Latest Calibration Saved</h3>
+          <p>Deviation parameters:</p>
+          <ul>
+            {Object.entries(latestEta).map(([key, value]) => (
+              <li key={key}>{key}: {(value * 100).toFixed(2)}%</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {selectedExercise && !showCalibrationManager && canonicalBaseline && (
+        <div className="calibration-summary-panel">
+          <h3>Baseline Overview</h3>
+          <div className="baseline-overview">
+            <div>
+              <strong>Workout:</strong>
+              {usingDefaultWorkout || !workoutRecord ? (
+                <ul>
+                  {Object.entries(canonicalBaseline).map(([key, value]) => (
+                    <li key={`workout-default-${key}`}>{key}: {Number(value).toFixed(1)}°</li>
+                  ))}
+                </ul>
+              ) : (
+                <>
+                  <p className="baseline-meta">Captured {new Date(workoutRecord.timestamp).toLocaleString()}</p>
+                  <ul>
+                    {Object.entries(workoutRecord.angles || {}).map(([key, value]) => (
+                      <li key={`workout-${key}`}>{key}: {Number(value).toFixed(1)}°</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+            <div>
+              <strong>Calibration:</strong>
+              {usingDefaultCalibration || !calibrationRecord ? (
+                <ul>
+                  {Object.entries(canonicalBaseline).map(([key, value]) => (
+                    <li key={`cal-default-${key}`}>{key}: {Number(value).toFixed(1)}°</li>
+                  ))}
+                </ul>
+              ) : (
+                <>
+                  <p className="baseline-meta">Captured {new Date(calibrationRecord.timestamp).toLocaleString()}</p>
+                  <ul>
+                    {Object.entries(calibrationRecord.angles || {}).map(([key, value]) => (
+                      <li key={`cal-${key}`}>{key}: {Number(value).toFixed(1)}°</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {selectedExercise && showCalibrationManager && (
+        <div className="calibration-records-panel">
+          <h3>Calibration Records</h3>
+          <p className="calibration-note">
+            "Use for Workout" applies the saved angles during normal rep counting. "Use for Calibration" makes it the active reference when you enter calibration mode again.
+          </p>
+          <div className="critic-control">
+            <div>
+              <label>Critic (common): </label>
+              <input
+                type="number"
+                step="0.01"
+                value={criticInputs.common}
+                onChange={(e) => handleCriticChange('common', e.target.value)}
+              />
+              <button onClick={() => handleCriticSubmit('common')}>Apply</button>
+            </div>
+            <div>
+              <label>Critic (calibration): </label>
+              <input
+                type="number"
+                step="0.01"
+                value={criticInputs.calibration}
+                onChange={(e) => handleCriticChange('calibration', e.target.value)}
+              />
+              <button onClick={() => handleCriticSubmit('calibration')}>Apply</button>
+            </div>
+          </div>
+          <div className="calibration-defaults">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => handleUseDefault('common')}
+            >
+              Use Default Workout Baseline
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => handleUseDefault('calibration')}
+            >
+              Use Default Calibration Baseline
+            </button>
+          </div>
+          <div className="baseline-status">
+            <span><strong>Workout baseline:</strong> {workoutBaselineLabel}</span>
+            <span><strong>Calibration baseline:</strong> {calibrationBaselineLabel}</span>
+          </div>
+          {currentRecords.length === 0 && <p>No calibrations saved yet. Record a new one to personalize thresholds.</p>}
+          {currentRecords.length > 0 && (
+            <div className="calibration-records-list">
+              {currentRecords.map(record => {
+                const activeCommon = currentSummary.active?.common === record.id;
+                const activeCal = currentSummary.active?.calibration === record.id;
+                const isSelected = selectedRecordId === record.id;
+                return (
+                  <div
+                    key={record.id}
+                    className={`calibration-record-card ${isSelected ? 'selected' : ''} ${(activeCommon || activeCal) ? 'active' : ''}`}
+                    onClick={() => {
+                      selectedRecordIdRef.current = record.id;
+                      setSelectedRecordId(record.id);
+                    }}
+                  >
+                    <div className="calibration-record-header">
+                      <span>{new Date(record.timestamp).toLocaleString()}</span>
+                      <div className="badges">
+                        {activeCommon && <span className="badge">Workout</span>}
+                        {activeCal && <span className="badge calibration">Calibration</span>}
+                      </div>
+                    </div>
+                    <div className="calibration-record-body">
+                      <p><strong>Mode:</strong> {record.mode}</p>
+                      <ul>
+                        {record.eta && Object.entries(record.eta).map(([key, value]) => (
+                          <li key={key}>{key}: {(value * 100).toFixed(1)}%</li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div className="calibration-record-actions">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          sendCommand({ command: 'use_calibration', record_id: record.id, mode: 'common' });
+                        }}
+                      >
+                        Use for Workout
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          sendCommand({ command: 'use_calibration', record_id: record.id, mode: 'calibration' });
+                        }}
+                      >
+                        Use for Calibration
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteCalibration(record.id);
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {selectedRecord && (
+            <div className="calibration-record-detail">
+              <h4>Calibration Details</h4>
+              <p><strong>Critic at capture:</strong> {selectedRecord.critic ?? 'N/A'}</p>
+              <p><strong>Angles:</strong></p>
+              <ul>
+                {selectedRecord.angles && Object.entries(selectedRecord.angles).map(([key, value]) => (
+                  <li key={key}>{key}: {Number(value).toFixed(1)}°</li>
+                ))}
+              </ul>
+              <p><strong>Deviation:</strong></p>
+              <ul>
+                {selectedRecord.eta && Object.entries(selectedRecord.eta).map(([key, value]) => (
+                  <li key={key}>{key}: {(value * 100).toFixed(2)}%</li>
+                ))}
+              </ul>
+              <div className="calibration-images">
+                {selectedRecord.images && Object.entries(selectedRecord.images).map(([key, img]) => (
+                  img ? (
+                    <div key={key} className="calibration-image">
+                      <p>{key}</p>
+                      <img src={`data:image/jpeg;base64,${img}`} alt={`${key} pose`} />
+                    </div>
+                  ) : null
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       {!isMediaPipeReady && <div>Loading MediaPipe libraries...</div>}
 
       {isMediaPipeReady && appState === 'selection' && (
@@ -272,17 +911,13 @@ function App() {
           <p className="calibration-note">Calibration is optional—jump straight into a workout or capture personalized ranges first.</p>
           <div className="exercise-grid">
             {EXERCISES.map(exercise => (
-              <div key={exercise.id} className="exercise-card">
+              <div
+                key={exercise.id}
+                className={`exercise-card ${selectedExercise === exercise.id ? 'selected' : ''}`}
+                onClick={() => handleSelectExercise(exercise.id)}
+              >
                 <h3>{exercise.label}</h3>
                 <p>{exercise.description}</p>
-                <div className="exercise-actions">
-                  <button className="secondary" onClick={() => startWorkoutWithoutCalibration(exercise.id)}>
-                    Start Workout
-                  </button>
-                  <button onClick={() => startCalibration(exercise.id)}>
-                    Calibrate First
-                  </button>
-                </div>
               </div>
             ))}
           </div>
@@ -337,7 +972,32 @@ function App() {
             ></video>
             <canvas ref={canvasRef} style={{ display: 'none' }}></canvas>
             {/* 3D Avatar disabled - avatar.glb missing */}
-          </div>
+            <AROverlay 
+              landmarks={poseLandmarks}
+              feedbackLandmarks={feedbackLandmarks}
+              selectedExercise={selectedExercise}
+              backend={backendName}
+              currentAngles={{
+                rightElbow: rightElbowAngle ? parseFloat(rightElbowAngle) : 0,
+                rightKnee: rightKneeAngle ? parseFloat(rightKneeAngle) : 0
+              }}
+              targetAngles={{
+                rightElbow: 45,
+              rightKnee: 90
+            }}
+          />
+        </div>
+        <div className="calibration-actions">
+          <button type="button" onClick={cancelCalibration} className="secondary-button">
+            Cancel Calibration
+          </button>
+        </div>
+      </div>
+    )}
+      {isMediaPipeReady && appState === 'calibration_saving' && (
+        <div className="calibration">
+          <h2>Finishing Calibration</h2>
+          <p>Processing snapshots and saving your deviation parameters...</p>
         </div>
       )}
 
@@ -392,6 +1052,7 @@ function App() {
               landmarks={poseLandmarks}
               feedbackLandmarks={feedbackLandmarks}
               selectedExercise={selectedExercise}
+              backend={backendName}
               currentAngles={{
                 rightElbow: rightElbowAngle ? parseFloat(rightElbowAngle) : 0,
                 rightKnee: rightKneeAngle ? parseFloat(rightKneeAngle) : 0
