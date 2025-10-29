@@ -123,7 +123,7 @@ export POSE_BACKEND=mediapipe_2d   # default 2.5D MediaPipe pipeline
 # or
 export POSE_BACKEND=mediapipe_3d   # MediaPipe world-landmark 3D pipeline
 # Optional (requires extra deps/config):
-export POSE_BACKEND=movenet_3d     # TensorFlow MoveNet 3D (needs MOVENET_3D_MODEL)
+export POSE_BACKEND=movenet_3d     # Calls external MoveNet microservice (see below)
 export POSE_BACKEND=mmpose_poselifter  # MMPose PoseLifter (needs MMPOSE_CONFIG/MMPOSE_CHECKPOINT)
 uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 ```
@@ -132,9 +132,55 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 can react accordingly.
 
 > **Note:** `mediapipe_3d` shares the existing calibration logic and is ready to use.
-> The MoveNet and MMPose integrations are scaffolds—install their dependencies,
-> provide pre-trained models via the environment variables shown above, and
-> extend the decoding logic to map their outputs into the FitCoachAR payload.
+> The `mmpose_poselifter` backend is still a scaffold and needs a full 2D detector +
+> lifter integration before it produces results.
+
+#### Calibration modes and critic controls
+
+Every exercise now supports two runtime modes:
+
+- **Common mode** – everyday training with the currently selected calibration.
+- **Calibration mode** – review previous captures or record a new baseline.
+
+When you record a new calibration the backend stores:
+
+- Extended/contracted angles (or squat up/down)
+- Per-joint deviation parameters (η)
+- Critic thresholds (δ) for common and calibration modes
+- Base64 snapshots of the captured poses for later review
+
+Use the mode toggle in the UI to switch between common and calibration workflows, adjust
+the critic level for each mode, and replay past calibrations (including the captured
+snapshots and deviation metrics).
+
+#### MoveNet (external microservice)
+TensorFlow’s macOS build pins older `typing-extensions`/`numpy`, so we run MoveNet in a
+separate environment and call it over HTTP.
+
+1. **Create a TensorFlow environment**
+   ```bash
+   conda create -n movenet python=3.10
+   conda activate movenet
+   pip install tensorflow-macos==2.13.1 tensorflow-metal==1.0.0
+   pip install numpy==1.24.3 typing-extensions<4.6 opencv-python==4.7.0.72 flask
+   ```
+2. **Download a TFLite MoveNet model** (e.g. MultiPose Lightning LiteRT) and note its path.
+3. **Run the service**:
+   ```bash
+   python backend/services/movenet_service.py \
+     --model /path/to/movenet_3d.tflite \
+     --host 127.0.0.1 --port 8502
+   ```
+   The service exposes `POST /infer` and stays running in this environment.
+4. **Back in the main FitCoachAR environment**, point the backend at the service:
+   ```bash
+   export POSE_BACKEND=movenet_3d
+   export MOVENET_SERVICE_URL=http://127.0.0.1:8502/infer
+   uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+   ```
+
+With that setup, the backend streams frames to the MoveNet service and receives 17 keypoints
+plus scores, while the main FastAPI process keeps using modern dependencies.
 
 ### Frontend Setup
 ```bash

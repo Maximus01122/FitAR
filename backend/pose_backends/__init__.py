@@ -1,25 +1,32 @@
-"""Pose backend registry for FitCoachAR.
+"""Pose backend registry for FitCoachAR with graceful dependency handling."""
 
-Allows the WebSocket server to swap between different pose-processing
-implementations (2D MediaPipe, future 3D, etc.) without touching the
-transport layer.
-"""
+from __future__ import annotations
 
+import importlib
+import logging
 from typing import Dict, Type
 
 from .base import PoseBackend
-from .mediapipe2d import MediaPipe2DPoseBackend
-from .mediapipe3d import MediaPipe3DBackend
-from .mmpose_lifter import MMPosePoseLifterBackend
-from .movenet3d import MoveNet3DBackend
+
+logger = logging.getLogger(__name__)
+
+BACKEND_REGISTRY: Dict[str, Type[PoseBackend]] = {}
 
 
-BACKEND_REGISTRY: Dict[str, Type[PoseBackend]] = {
-    MediaPipe2DPoseBackend.name: MediaPipe2DPoseBackend,
-    MediaPipe3DBackend.name: MediaPipe3DBackend,
-    MoveNet3DBackend.name: MoveNet3DBackend,
-    MMPosePoseLifterBackend.name: MMPosePoseLifterBackend,
-}
+def _register(module_name: str, class_name: str) -> None:
+    """Attempt to import and register a backend class."""
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+        backend_cls: Type[PoseBackend] = getattr(module, class_name)
+        BACKEND_REGISTRY[backend_cls.name] = backend_cls
+    except Exception as exc:
+        logger.warning("Skipping backend %s.%s: %s", module_name, class_name, exc)
+
+
+_register("mediapipe2d", "MediaPipe2DPoseBackend")
+_register("mediapipe3d", "MediaPipe3DBackend")
+_register("movenet3d", "MoveNet3DBackend")
+_register("mmpose_lifter", "MMPosePoseLifterBackend")
 
 
 def get_available_backends():
