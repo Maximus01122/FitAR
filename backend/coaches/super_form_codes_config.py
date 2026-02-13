@@ -11,7 +11,7 @@ SUPER_FORM_CODES_CONFIG = {
         "GOOD_REP": {
             "description": "A well-executed squat with good depth and form.",
             "rules": [
-                {"form_code": "squat_depth", "must_be": ["deep"]},
+                {"form_code": "squat_depth", "must_be": ["deep", "parallel"]},
                 {"form_code": "knee_stability", "must_not_be": ["unstable", "slight_wobble"]},
                 {"form_code": "torso_angle", "must_not_be": ["bent_over", "leaning"]}
             ]
@@ -19,7 +19,7 @@ SUPER_FORM_CODES_CONFIG = {
         "SHALLOW_DEPTH": {
             "description": "The user did not go deep enough.",
             "rules": [
-                {"form_code": "squat_depth", "must_be": ["shallow", "parallel"]}
+                {"form_code": "squat_depth", "must_be": ["shallow"]}
             ]
         },
         "KNEE_COLLAPSE": {
@@ -37,7 +37,7 @@ SUPER_FORM_CODES_CONFIG = {
         "RUSHED_DESCENT": {
             "description": "The user dropped into the squat too quickly, losing control.",
             "rules": [
-                {"form_code": "descent_speed", "must_be": ["dive"]}
+                {"form_code": "descent_speed", "must_be": ["dive", "fast"]}
             ]
         },
         "UNSTABLE_MOVEMENT": {

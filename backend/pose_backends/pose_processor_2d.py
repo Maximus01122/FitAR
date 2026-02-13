@@ -116,6 +116,10 @@ class PoseProcessor(PoseBackend):
             torso_cat = self.form_analyzer.categorize_primitive("squats", "torso_angle", torso_angle)
             static_primitives["torso_angle"] = {"value": round(torso_angle, 1), "category": torso_cat}
             
+            stance_width = critical.get("stance_width", 0) # Assumes buffered frame has this
+            stance_cat = self.form_analyzer.categorize_primitive("squats", "stance_width", stance_width)
+            static_primitives["stance_width"] = {"value": round(stance_width, 2), "category": stance_cat}
+            
         elif exercise == "bicep_curls":
             flexion_angle = critical.get("elbow_angle", 90)
             flexion_cat = self.form_analyzer.categorize_primitive("bicep_curls", "peak_flexion", flexion_angle)
@@ -139,6 +143,30 @@ class PoseProcessor(PoseBackend):
             ascent_frames = frames[min_idx:] if min_idx < len(frames) - 1 else frames[-1:]
             
             if exercise == "squats":
+                # Pause at bottom
+                # Time spent within 10 degrees of bottom metic
+                bottom_depth = self.rep_buffer["min_angle"]
+                threshold = bottom_depth + 10.0
+                pause_frames_count = sum(1 for f in frames if f.get("primary_angle", 180) <= threshold)
+                # Estimate duration (assuming 30fps if timestamps not reliable, or use timestamp diff?)
+                # We have timestamps in frames
+                if len(frames) > 0:
+                     # Calculate total duration of those frames?
+                     # Simple approximation: (count / total) * total_duration OR just count * frame_duration
+                     # Let's use timestamps if available
+                     if pause_frames_count > 0:
+                         # Filter frames in window
+                         pause_frames = [f for f in frames if f.get("primary_angle", 180) <= threshold]
+                         if len(pause_frames) >= 2:
+                             pause_duration = pause_frames[-1]["timestamp"] - pause_frames[0]["timestamp"]
+                         else:
+                             pause_duration = 0.0 # < 2 frames
+                     else:
+                         pause_duration = 0.0
+                     
+                     pause_cat = self.form_analyzer.categorize_primitive("squats", "pause_at_bottom", pause_duration)
+                     dynamic_primitives["pause_at_bottom"] = {"value": round(pause_duration, 2), "category": pause_cat}
+
                 if len(descent_frames) >= 2:
                     descent_time = descent_frames[-1].get("timestamp", 0) - descent_frames[0].get("timestamp", 0)
                     if descent_time > 0:
@@ -239,6 +267,9 @@ class PoseProcessor(PoseBackend):
                 self.counters[exercise] = NormalizedRepCounter(active)
                 self.checkers[exercise] = FormChecker(active)
 
+            # Update FormAnalyzer with personalized thresholds
+            self.form_analyzer.set_calibration(active)
+
             return {
                 "event": "exercise_selected",
                 "exercise": exercise,
@@ -266,6 +297,7 @@ class PoseProcessor(PoseBackend):
             # Update Engines
             self.counters[exercise] = NormalizedRepCounter(params)
             self.checkers[exercise] = FormChecker(params)
+            self.form_analyzer.set_calibration(params)
 
             return {
                 "event": "calibration_saved",
@@ -305,6 +337,12 @@ class PoseProcessor(PoseBackend):
                 self.counters[exercise].reset()
             return {"summary": {"total_reps": 0}}
 
+        if command == "start_manual_calibration":
+            self.calibration_session = {"exercise": exercise, "end_time": None}
+            self.calibration_buffer = []
+            self.calibration_timestamps = []
+            return {"event": "calibration_started", "exercise": exercise, "mode": "manual"}
+
         if command == "start_auto_calibration":
             self.calibration_session = {"exercise": exercise, "end_time": time.time() + 15.0}
             self.calibration_buffer = []
@@ -335,6 +373,41 @@ class PoseProcessor(PoseBackend):
             # Init Engines immediately
             self.counters[exercise] = NormalizedRepCounter(params)
             self.checkers[exercise] = FormChecker(params)
+            self.form_analyzer.set_calibration(params)
+
+            self.calibration_session = None
+            self.calibration_buffer = []
+
+            return {
+                "event": "calibration_complete",
+                "exercise": exercise,
+                "record": {"id": rec_id, "calibration_params": params.to_dict()}
+            }
+
+        if command == "stop_manual_calibration":
+            if not self.calibration_session:
+                return {"event": "error", "message": "No session"}
+
+            landmarks_array = np.stack(self.calibration_buffer, axis=0)
+            try:
+                # Run the geometry analysis
+                calib_result = calibrate_from_landmarks(
+                    landmarks_array,
+                    self.joint_map,
+                    exercise=exercise,
+                    smoothing_window=5,
+                    fps=30
+                )
+            except Exception as e:
+                return {"event": "calibration_error", "message": str(e)}
+
+            params = calib_result.params
+            rec_id = self.param_store.add_calibration_record(exercise, params, make_active=True)
+
+            # Init Engines immediately
+            self.counters[exercise] = NormalizedRepCounter(params)
+            self.checkers[exercise] = FormChecker(params)
+            self.form_analyzer.set_calibration(params)
 
             self.calibration_session = None
             self.calibration_buffer = []
@@ -531,6 +604,7 @@ class PoseProcessor(PoseBackend):
                 "hip_y": metrics["form"].get("hip_y", 0),
                 "knee_x": metrics["form"].get("knee_x", 0),
                 "shoulder_z": metrics["form"].get("shoulder_z", 0),
+                "stance_width": metrics["form"].get("stance_width", 0),
             }
             
             # Start buffering when entering the movement phase

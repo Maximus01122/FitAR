@@ -103,7 +103,7 @@ def run_inference(
     input_tensor = preprocess(frame_bgr, input_details, fallback_size)
     interpreter.set_tensor(input_details["index"], input_tensor)
     interpreter.invoke()
-    output = interpreter.get_tensor(output_details["index"])  # [1, 6, 56]
+    output = interpreter.get_tensor(output_details["index"]).copy()  # [1, 6, 56]
     detections = output[0]
     best_idx = np.argmax(detections[:, -1])
     best_score = detections[best_idx, -1]
@@ -335,7 +335,7 @@ def main():
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     app = create_app(args.model, args.input_size)
-    app.run(host=args.host, port=args.port)
+    app.run(host=args.host, port=args.port, threaded=False)
 
 
 if __name__ == "__main__":
