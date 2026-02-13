@@ -206,6 +206,15 @@ class KinematicFeatureExtractor:
             # Form: Hip Symmetry (Vertical diff)
             metrics["form"]["hip_symmetry"] = abs(p("LEFT_HIP")[1] - p("RIGHT_HIP")[1]) * scale
 
+            # Form: Stance Width (Ankle Width / Shoulder Width)
+            # shoulder_width is already calculated above as inverse of 'scale' usually, but let's recompute or use it.
+            # scale = 1.0 / shoulder_width. So shoulder_width = 1.0 / scale
+            if scale > 0:
+                sh_width = 1.0 / scale
+                ank_width = helper._compute_distance(p("LEFT_ANKLE"), p("RIGHT_ANKLE"))
+                metrics["form"]["stance_width"] = ank_width / sh_width if sh_width > 0.01 else 0.0
+
+
         return metrics
 
 class AngularFeatureExtractor:

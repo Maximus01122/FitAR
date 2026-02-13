@@ -64,7 +64,7 @@ class FormChecker:
             target = user_caps["rom_min"]
 
             # Allow gap based on critic
-            allowed_gap = 15.0 * tolerance_mp
+            allowed_gap = 15.0 * tolerance_multiplier
 
             if rep_progress < 0.3 and val > (target + allowed_gap):
                 feedback.append("Go deeper!")
@@ -135,6 +135,67 @@ class FormAnalyzer:
     def __init__(self):
         self.form_codes_config = FORM_CODES_CONFIG
         self.super_form_codes_config = SUPER_FORM_CODES_CONFIG
+        self._calibration_overrides: Dict[str, list] = {}  # metric -> override categories
+
+    def set_calibration(self, params) -> None:
+        """
+        Derive personalized threshold overrides from calibration data.
+        Overrides only the metrics that have corresponding calibration info;
+        everything else keeps using FORM_CODES_CONFIG.
+        """
+        self._calibration_overrides = {}
+        if params is None:
+            return
+
+        caps = getattr(params, 'capabilities', None) or (params.capabilities if hasattr(params, 'capabilities') else {})
+        constraints = getattr(params, 'form_constraints', None) or (params.form_constraints if hasattr(params, 'form_constraints') else {})
+
+        # --- squat_depth: based on user's ROM ---
+        rom_min = caps.get('rom_min') if isinstance(caps, dict) else None
+        rom_max = caps.get('rom_max') if isinstance(caps, dict) else None
+        if rom_min is not None and rom_max is not None:
+            # rom_min = deepest angle, rom_max = standing angle.
+            # Divide the range into thirds:
+            #   deep   = bottom third of ROM (near full depth)
+            #   parallel = middle third (acceptable range)
+            #   shallow  = top third (not reaching target depth)
+            rom_range = rom_max - rom_min
+            deep_limit = rom_min + rom_range * 0.33
+            parallel_limit = rom_min + rom_range * 0.66
+            self._calibration_overrides['squat_depth'] = [
+                {"name": "deep", "v_max": deep_limit},
+                {"name": "parallel", "v_min": deep_limit, "v_max": parallel_limit},
+                {"name": "shallow", "v_min": parallel_limit},
+            ]
+
+        # --- stance_width: based on user's baseline mean ± 2σ ---
+        sw = constraints.get('stance_width') if isinstance(constraints, dict) else None
+        if sw and 'mean' in sw and 'std' in sw:
+            mean, std = sw['mean'], sw['std']
+            lo = mean - 2 * std
+            hi = mean + 2 * std
+            self._calibration_overrides['stance_width'] = [
+                {"name": "narrow", "v_max": lo},
+                {"name": "shoulder_width", "v_min": lo, "v_max": hi},
+                {"name": "wide", "v_min": hi, "v_max": hi + 0.4},
+                {"name": "plie", "v_min": hi + 0.4},
+            ]
+
+        # --- torso_angle: based on user's baseline mean + Nσ ---
+        tl = constraints.get('torso_lean') if isinstance(constraints, dict) else None
+        if tl and 'mean' in tl and 'std' in tl:
+            mean, std = tl['mean'], tl['std']
+            upright_max = mean + 2 * std
+            leaning_max = mean + 4 * std
+            self._calibration_overrides['torso_angle'] = [
+                {"name": "upright", "v_max": upright_max},
+                {"name": "leaning", "v_min": upright_max, "v_max": leaning_max},
+                {"name": "bent_over", "v_min": leaning_max},
+            ]
+
+    def clear_calibration(self) -> None:
+        """Remove all personalized overrides, reverting to fixed config."""
+        self._calibration_overrides = {}
     
     def categorize_form_code(
         self, 
@@ -153,9 +214,21 @@ class FormAnalyzer:
         Returns:
             Category name (e.g., "deep", "controlled") or None if not found
         """
+        # 1. Check for personalized calibration overrides first
+        if form_code_name in self._calibration_overrides:
+            categories = self._calibration_overrides[form_code_name]
+            for cat in categories:
+                v_min = cat.get("v_min")
+                v_max = cat.get("v_max")
+                min_ok = (v_min is None) or (value >= v_min)
+                max_ok = (v_max is None) or (value < v_max)
+                if min_ok and max_ok:
+                    return cat["name"]
+            return None
+
+        # 2. Fall back to fixed config
         exercise_config = self.form_codes_config.get(exercise, {})
         
-        # Check both static and dynamic form codes
         form_code_config = None
         for ptype in ["static", "dynamic"]:
             if form_code_name in exercise_config.get(ptype, {}):
@@ -170,11 +243,8 @@ class FormAnalyzer:
         for cat in categories:
             v_min = cat.get("v_min")
             v_max = cat.get("v_max")
-            
-            # Check if value falls within this category's range
             min_ok = (v_min is None) or (value >= v_min)
             max_ok = (v_max is None) or (value < v_max)
-            
             if min_ok and max_ok:
                 return cat["name"]
         
