@@ -35,7 +35,8 @@ FORM_CODES_CONFIG = {
                 "categories": [
                     {"name": "narrow", "v_max": 0.9},
                     {"name": "shoulder_width", "v_min": 0.9, "v_max": 1.2},
-                    {"name": "wide", "v_min": 1.2}
+                    {"name": "wide", "v_min": 1.2, "v_max": 1.6},
+                    {"name": "plie", "v_min": 1.6}
                 ]
             },
             "knee_forward_travel": {
@@ -97,6 +98,16 @@ FORM_CODES_CONFIG = {
                     {"name": "level", "v_max": 0.03},
                     {"name": "slight_shift", "v_min": 0.03, "v_max": 0.07},
                     {"name": "major_shift", "v_min": 0.07}
+                ]
+            },
+            "pause_at_bottom": {
+                "type": "duration",
+                "description": "Time spent at the bottom of the squat (near max depth).",
+                "unit": "seconds",
+                "categories": [
+                    {"name": "touch_and_go", "v_max": 0.5},
+                    {"name": "pause", "v_min": 0.5, "v_max": 1.5},
+                    {"name": "long_hold", "v_min": 1.5}
                 ]
             }
         }

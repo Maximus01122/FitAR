@@ -30,6 +30,7 @@ POST_REP_COMMANDS = {
         "KNEE_CAVE": ["Knees out!", "Push knees out!", "No knee cave!"],
         "FORWARD_LEAN": ["Chest up!", "Stay upright!", "Don't lean!"],
         "HIP_ASYMMETRY": ["Level hips!", "Balance sides!", "Even push!"],
+        "RUSHED_DESCENT": ["Slow it down, champ!", "Control descent!", "Feel the burn!"],
         "GOOD_REP": ["Good depth!", "Great squat!", "Perfect form!"],
     },
 }
