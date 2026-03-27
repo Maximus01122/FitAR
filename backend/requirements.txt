@@ -13,3 +13,8 @@ uvicorn
 uvloop
 requests
 cerebras-cloud-sdk
+django
+channels
+djangorestframework
+channels-redis
+redis

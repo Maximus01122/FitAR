@@ -21,9 +21,12 @@ This project implements the concepts from:
 
 ## 🏗️ Architecture
 
-### Backend (Python/FastAPI)
+### Backend (Python/Django + DRF + Channels)
 - **`pose_backends/`**: Pluggable pose-processing engines (MediaPipe 2D default, 3D-ready scaffold)
-- **`main.py`**: WebSocket server that streams frames to the active pose backend
+- **`main.py`**: ASGI entrypoint for the Django/Channels backend
+- **`api/models.py`**: ORM models for calibrations, workout sessions, form analysis, and LLM logs
+- **`api/views.py`**: DRF API endpoints for summaries, saved workouts/sessions, and analysis
+- **`api/admin.py`**: Django admin configuration for inspecting workout/calibration data
 - **`kinematics.py`**: Body-relative frames, angular feature extraction, forward kinematics
 - **`llm_feedback.py`**: Template-based and API-driven natural language generation
 - **`filters.py`**: Kalman filtering for landmark smoothing
@@ -100,6 +103,7 @@ cd fitcoachar/backend
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python manage.py migrate
 ```
 
 **Required packages** (`requirements.txt`):
@@ -125,7 +129,7 @@ export POSE_BACKEND=mediapipe_3d   # MediaPipe world-landmark 3D pipeline
 # Optional (requires extra deps/config):
 export POSE_BACKEND=movenet_3d     # Calls external MoveNet microservice (see below)
 export POSE_BACKEND=mmpose_poselifter  # MMPose PoseLifter (needs MMPOSE_CONFIG/MMPOSE_CHECKPOINT)
-uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+python manage.py runserver 0.0.0.0:8000
 ```
 
 `GET /` reports the active backend plus all registered options so clients/frontends
@@ -176,7 +180,14 @@ separate environment and call it over HTTP.
    ```bash
    export POSE_BACKEND=movenet_3d
    export MOVENET_SERVICE_URL=http://127.0.0.1:8502/infer
-   uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+python manage.py runserver 0.0.0.0:8000
+
+For production-style realtime scaling, set `REDIS_URL` so Channels and Django cache can
+share state through Redis:
+
+```bash
+export REDIS_URL=redis://127.0.0.1:6379/1
+```
    ```
 
 With that setup, the backend streams frames to the MoveNet service and receives 17 keypoints
@@ -196,8 +207,26 @@ npm install
 ```bash
 cd backend
 source venv/bin/activate
-uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+python manage.py migrate
+python manage.py runserver 0.0.0.0:8000
 ```
+
+### Django Admin
+Create a superuser and inspect persisted sessions/calibrations via the admin UI:
+
+```bash
+python manage.py createsuperuser
+```
+
+Then open `http://localhost:8000/admin/`.
+
+### DRF API Examples
+
+- `GET /api/v1/workout-sessions`
+- `GET /api/v1/workout-sessions/<uuid>`
+- `GET /api/v1/calibrations/bicep_curls`
+- `POST /api/v1/summary`
+- `POST /api/v1/form-analysis`
 
 ### 2. Start Frontend Dev Server
 ```bash

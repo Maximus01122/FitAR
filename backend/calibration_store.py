@@ -1,17 +1,25 @@
-import json
 import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-DEFAULT_STORE_PATH = Path(__file__).resolve().parent / "calibrations.json"
+
 DEFAULT_CRITIC = 0.2
 
 
 def _timestamp() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+def _get_models() -> Tuple[Any, Any]:
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "fitcoach_backend.settings")
+    import django
+    from django.apps import apps
+
+    if not apps.ready:
+        django.setup()
+    return apps.get_model("api", "CalibrationPreference"), apps.get_model("api", "CalibrationRecordModel")
 
 
 @dataclass
@@ -41,101 +49,123 @@ class CalibrationRecord:
 
 
 class CalibrationStore:
-    def __init__(self, path: Path = DEFAULT_STORE_PATH):
-        self.path = path
-        self.data: Dict[str, Any] = {
-            "exercises": {},
-        }
-        self._load()
-
-    def _load(self):
-        if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text())
-            except json.JSONDecodeError:
-                self.data = {"exercises": {}}
-
-    def _save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2))
-
     def _ensure_exercise(self, exercise: str):
-        exercises = self.data.setdefault("exercises", {})
-        if exercise not in exercises:
-            exercises[exercise] = {
-                "records": [],
-                "active": {"common": None, "calibration": None},
-                "critics": {"common": DEFAULT_CRITIC, "calibration": DEFAULT_CRITIC},
-            }
+        CalibrationPreference, _ = _get_models()
+        preference, _ = CalibrationPreference.objects.get_or_create(
+            exercise=exercise,
+            defaults={"critics": {"common": DEFAULT_CRITIC, "calibration": DEFAULT_CRITIC}},
+        )
+        critics = dict(preference.critics or {})
+        critics.setdefault("common", DEFAULT_CRITIC)
+        critics.setdefault("calibration", DEFAULT_CRITIC)
+        if critics != preference.critics:
+            preference.critics = critics
+            preference.save(update_fields=["critics", "updated_at"])
+        return preference
 
     def list_records(self, exercise: str) -> List[Dict[str, Any]]:
+        _, CalibrationRecordModel = _get_models()
         self._ensure_exercise(exercise)
-        return list(self.data["exercises"][exercise]["records"])
+        return [self._model_to_dict(record) for record in CalibrationRecordModel.objects.filter(exercise=exercise)]
 
     def add_record(self, record: CalibrationRecord):
-        exercise = record.exercise
-        self._ensure_exercise(exercise)
-        records = self.data["exercises"][exercise]["records"]
-        records = [r for r in records if r["id"] != record.id]
-        records.append(record.to_dict())
-        # Sort newest first
-        records.sort(key=lambda r: r["timestamp"], reverse=True)
-        self.data["exercises"][exercise]["records"] = records
-        self.set_active_record(exercise, record.mode, record.id, save=False)
-        self._save()
+        CalibrationPreference, CalibrationRecordModel = _get_models()
+        preference = self._ensure_exercise(record.exercise)
+        record_model, _ = CalibrationRecordModel.objects.update_or_create(
+            id=record.id,
+            defaults={
+                "exercise": record.exercise,
+                "mode": record.mode,
+                "timestamp": record.timestamp,
+                "angles": record.angles,
+                "eta": record.eta,
+                "canonical": record.canonical,
+                "critic": record.critic,
+                "images": record.images,
+            },
+        )
+        field_name = self._active_field_name(record.mode)
+        setattr(preference, field_name, record_model)
+        preference.save(update_fields=[field_name, "updated_at"])
 
-    def set_active_record(
-        self, exercise: str, mode: str, record_id: Optional[str], save: bool = True
-    ):
-        self._ensure_exercise(exercise)
+    def set_active_record(self, exercise: str, mode: str, record_id: Optional[str], save: bool = True):
+        CalibrationPreference, CalibrationRecordModel = _get_models()
+        preference = self._ensure_exercise(exercise)
+        field_name = self._active_field_name(mode)
         if record_id is not None:
-            records = self.data["exercises"][exercise]["records"]
-            if not any(rec["id"] == record_id for rec in records):
+            try:
+                record = CalibrationRecordModel.objects.get(id=record_id, exercise=exercise)
+            except CalibrationRecordModel.DoesNotExist:
                 return False
-        self.data["exercises"][exercise]["active"][mode] = record_id
+            setattr(preference, field_name, record)
+        else:
+            setattr(preference, field_name, None)
         if save:
-            self._save()
+            preference.save(update_fields=[field_name, "updated_at"])
         return True
 
     def get_active_record(self, exercise: str, mode: str) -> Optional[Dict[str, Any]]:
-        self._ensure_exercise(exercise)
-        record_id = self.data["exercises"][exercise]["active"].get(mode)
-        if not record_id:
+        preference = self._ensure_exercise(exercise)
+        field_name = self._active_field_name(mode)
+        record = getattr(preference, field_name)
+        if not record:
             return None
-        for record in self.data["exercises"][exercise]["records"]:
-            if record["id"] == record_id:
-                return record
-        return None
+        return self._model_to_dict(record)
 
     def set_critic(self, exercise: str, mode: str, critic: float):
-        self._ensure_exercise(exercise)
-        self.data["exercises"][exercise]["critics"][mode] = critic
-        self._save()
+        preference = self._ensure_exercise(exercise)
+        critics = dict(preference.critics or {})
+        critics[mode] = critic
+        preference.critics = critics
+        preference.save(update_fields=["critics", "updated_at"])
 
     def delete_record(self, exercise: str, record_id: str) -> bool:
-        self._ensure_exercise(exercise)
-        info = self.data["exercises"][exercise]
-        original_len = len(info["records"])
-        info["records"] = [r for r in info["records"] if r["id"] != record_id]
-        if original_len == len(info["records"]):
+        CalibrationPreference, CalibrationRecordModel = _get_models()
+        preference = self._ensure_exercise(exercise)
+        try:
+            record = CalibrationRecordModel.objects.get(id=record_id, exercise=exercise)
+        except CalibrationRecordModel.DoesNotExist:
             return False
-        for mode in ("common", "calibration"):
-            if info["active"].get(mode) == record_id:
-                info["active"][mode] = None
-        self._save()
+        if preference.active_common_record_id == record.id:
+            preference.active_common_record = None
+        if preference.active_calibration_record_id == record.id:
+            preference.active_calibration_record = None
+        preference.save(update_fields=["active_common_record", "active_calibration_record", "updated_at"])
+        record.delete()
         return True
 
     def get_critics(self, exercise: str) -> Dict[str, float]:
-        self._ensure_exercise(exercise)
-        return dict(self.data["exercises"][exercise]["critics"])
+        preference = self._ensure_exercise(exercise)
+        critics = dict(preference.critics or {})
+        critics.setdefault("common", DEFAULT_CRITIC)
+        critics.setdefault("calibration", DEFAULT_CRITIC)
+        return critics
 
     def to_summary(self, exercise: str) -> Dict[str, Any]:
-        self._ensure_exercise(exercise)
-        info = self.data["exercises"][exercise]
+        preference = self._ensure_exercise(exercise)
         return {
-            "records": list(info["records"]),
-            "active": dict(info["active"]),
-            "critics": dict(info["critics"]),
+            "records": self.list_records(exercise),
+            "active": {
+                "common": str(preference.active_common_record_id) if preference.active_common_record_id else None,
+                "calibration": str(preference.active_calibration_record_id) if preference.active_calibration_record_id else None,
+            },
+            "critics": self.get_critics(exercise),
+        }
+
+    def _active_field_name(self, mode: str) -> str:
+        return "active_calibration_record" if mode == "calibration" else "active_common_record"
+
+    def _model_to_dict(self, record_model) -> Dict[str, Any]:
+        return {
+            "id": str(record_model.id),
+            "exercise": record_model.exercise,
+            "mode": record_model.mode,
+            "timestamp": record_model.timestamp,
+            "angles": record_model.angles,
+            "eta": record_model.eta,
+            "canonical": record_model.canonical,
+            "critic": record_model.critic,
+            "images": record_model.images,
         }
 
 
