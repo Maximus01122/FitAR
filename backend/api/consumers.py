@@ -21,7 +21,7 @@ class PoseConsumer(AsyncWebsocketConsumer):
             "WebSocket connection attempt received (backend=%s).",
             POSE_BACKEND_NAME,
         )
-        self.backend = build_active_backend()
+        self.backend = await sync_to_async(build_active_backend, thread_sensitive=True)()
         self.frame_times = deque(maxlen=60)
         self.last_payload = None
         await self.accept()
