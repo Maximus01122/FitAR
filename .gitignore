@@ -1,38 +1,30 @@
 # Ignore recorded datasets and local artifacts
 /dataset/
 .DS_Store
+**/.DS_Store
 backend/calibrations.json
-
-# Virtual env / caches
-backend/venv/
-
-# Large experiment artifacts
-fit3d_results/
-framewise_results*/
-framewise_kpts*/
-framewise_datset_kpts*/
-framewise_dataset_kpts*/
-framewise_metrics*/***
-fit3d_lifter_preds/
-fit3d_romp_preds/
-
-<<<<<<< HEAD
-# Large experiment artifacts
-fit3d_results/
-framewise_results*/
-framewise_kpts*/
-framewise_datset_kpts*/
-framewise_dataset_kpts*/
-framewise_metrics*/***
-fit3d_lifter_preds/
-fit3d_romp_preds/
-=======
 .env
 
+# Virtual env / caches
 **/venv/
+__pycache__/
+*.py[cod]
+.Python
+
+# Backend local data
 backend/workouts/
 backend/llm_logs/
 
+# Large experiment artifacts
+fit3d_results/
+framewise_results*/
+framewise_kpts*/
+framewise_datset_kpts*/
+framewise_dataset_kpts*/
+framewise_metrics*/
+fit3d_lifter_preds/
+fit3d_romp_preds/
 
-__pycache__
->>>>>>> refs/remotes/origin/main
+# Unused / duplicate MoveNet artifacts (runtime uses .tflite)
+models/movenet_3d/
+models/movenet_3d.tar.gz
